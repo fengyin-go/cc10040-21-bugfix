@@ -60,12 +60,21 @@ class ReportTemplateService(BaseModuleService):
             calibers = store.find_by_field("caliber_version", "所属指标", metric_name)
             active_caliber = next((c for c in calibers if c.get("status") == "已生效"), None)
 
+            # 报告只消费获准且实际完成的窗口差异（窗内、指标与记录日期一致）
+            from app.services.recalc_engine import RecalcEngineService
+            recalc_payload = RecalcEngineService().get_available_diffs(metric_name)
+            recalc_diffs = recalc_payload.get("items", [])
+
             sections.append({
                 "metric": metric_name,
                 "caliber_version": active_caliber.get("版本号") if active_caliber else "未知",
                 "caliber_desc": active_caliber.get("口径描述") if active_caliber else "未知",
                 "query_results_count": len(query_results),
                 "query_results": query_results,
+                "recalc_diff_count": len(recalc_diffs),
+                "recalc_diff_total": recalc_payload.get("diff_total", 0),
+                "recalc_diffs": recalc_diffs,
+                "recalc_diff_reason": recalc_payload.get("reason", ""),
             })
 
         return {

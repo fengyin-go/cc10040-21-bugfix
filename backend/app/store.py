@@ -26,8 +26,20 @@ class Store:
         self._cohort_snapshots: dict[str, list[dict[str, Any]]] = {}
         # Anomaly records
         self._anomaly_records: list[dict[str, Any]] = []
-        # Recalc history
+        # Recalc history（按尝试留痕，首次失败也保留）
         self._recalc_history: list[dict[str, Any]] = []
+        # 重算申请：指标定义登记时产生，重算引擎凭此取得指标身份/目标版次/日期范围
+        self._recalc_applications: list[dict[str, Any]] = []
+        # 每次启动尝试（失败与重试分别留痕）
+        self._recalc_attempts: list[dict[str, Any]] = []
+        # 重算结果明细：按任务与尝试回写
+        self._recalc_details: list[dict[str, Any]] = []
+        # 口径变更台账：重算引擎的输入数据（窗内/窗外/其他指标样本）
+        self._recalc_change_ledger: list[dict[str, Any]] = [
+            {"id": 1, "指标": "指标定义样例1", "记录日期": "2026-11-01", "旧值": 20, "新值": 30},
+            {"id": 2, "指标": "指标定义样例1", "记录日期": "2026-12-20", "旧值": 50, "新值": 80},
+            {"id": 3, "指标": "指标定义样例2", "记录日期": "2026-11-05", "旧值": 5, "新值": 9},
+        ]
         # Lock for thread safety
         self._lock = threading.Lock()
 
@@ -158,9 +170,89 @@ class Store:
         return self._anomaly_records
 
     # ── Recalc operations ──
+    # 身份链路：申请（登记）-> 任务（调度）-> 尝试（启动）-> 结果明细（窗口差异）
+
+    def recalc_applications(self) -> list[dict[str, Any]]:
+        return self._recalc_applications
+
+    def find_recalc_application(self, application_id: int) -> dict[str, Any] | None:
+        return next(
+            (a for a in self._recalc_applications
+             if int(a.get("id", 0)) == application_id),
+            None,
+        )
+
+    def save_recalc_application(self, application: dict[str, Any]) -> dict[str, Any]:
+        if "id" not in application:
+            application["id"] = (
+                max((int(a.get("id", 0)) for a in self._recalc_applications), default=0) + 1
+            )
+            self._recalc_applications.append(application)
+        return application
+
+    def recalc_attempts(self, task_id: int | None = None) -> list[dict[str, Any]]:
+        if task_id is None:
+            return list(self._recalc_attempts)
+        return [a for a in self._recalc_attempts if int(a.get("task_id", 0)) == task_id]
+
+    def successful_attempts(self, task_id: int) -> list[dict[str, Any]]:
+        return [
+            a for a in self.recalc_attempts(task_id)
+            if a.get("status") == "已完成"
+        ]
+
+    def add_recalc_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        attempt["id"] = (
+            max((int(a.get("id", 0)) for a in self._recalc_attempts), default=0) + 1
+        )
+        attempt.setdefault("尝试时间", time.strftime("%Y-%m-%d %H:%M:%S"))
+        self._recalc_attempts.append(attempt)
+        return attempt
+
+    def recalc_change_ledger(self) -> list[dict[str, Any]]:
+        return self._recalc_change_ledger
+
+    def recalc_details(self, task_id: int | None = None) -> list[dict[str, Any]]:
+        if task_id is None:
+            return list(self._recalc_details)
+        return [d for d in self._recalc_details
+                if int(d.get("task_id", 0)) == task_id]
+
+    def add_recalc_detail(self, detail: dict[str, Any]) -> dict[str, Any]:
+        detail["id"] = (
+            max((int(d.get("id", 0)) for d in self._recalc_details), default=0) + 1
+        )
+        self._recalc_details.append(detail)
+        return detail
+
+    def available_recalc_diffs(
+        self,
+        metric_name: str | None = None,
+        record_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """报告只消费获准且实际完成的窗口差异。
+
+        筛选条件：申请获准、尝试实际完成、明细落在窗内，且指标/记录日期一致。
+        """
+        diffs: list[dict[str, Any]] = []
+        for detail in self._recalc_details:
+            if not detail.get("在窗内") or not detail.get("已完成"):
+                continue
+            application = self.find_recalc_application(
+                int(detail.get("application_id", 0)))
+            if application is None or application.get("状态") not in ("待调度", "已完成"):
+                # 已取消/被关闭的申请不再对外供给差异
+                continue
+            if metric_name and detail.get("指标") != metric_name:
+                continue
+            if record_date and detail.get("记录日期") != record_date:
+                continue
+            diffs.append(detail)
+        return diffs
 
     def record_recalc(self, metric_id: int, old_version: str, new_version: str,
                       time_range: str, diff_summary: str) -> dict[str, Any]:
+        """兼容旧调用方的历史留痕入口，内部按尝试记录。"""
         record = {
             "id": len(self._recalc_history) + 1,
             "关联指标": f"metric_{metric_id}",
@@ -174,7 +266,31 @@ class Store:
         return record
 
     def recalc_history(self) -> list[dict[str, Any]]:
-        return self._recalc_history
+        """历史列表：真实来源为按任务与尝试回写的留痕（含首次失败）。"""
+        history: list[dict[str, Any]] = []
+        for attempt in self._recalc_attempts:
+            application = self.find_recalc_application(
+                int(attempt.get("application_id", 0))) or {}
+            history.append({
+                "id": attempt.get("id"),
+                "任务ID": attempt.get("task_id"),
+                "尝试序号": attempt.get("attempt_no"),
+                "申请ID": attempt.get("application_id"),
+                "关联指标": attempt.get("metric"),
+                "指标ID": application.get("metric_id"),
+                "旧口径": attempt.get("old_version"),
+                "新口径": attempt.get("new_version"),
+                "目标口径版本ID": attempt.get("target_caliber_id"),
+                "历史时间范围": attempt.get("time_range"),
+                "状态": attempt.get("status"),
+                "原因": attempt.get("reason", ""),
+                "产出差异": attempt.get("diff_summary", ""),
+                "差异条数": attempt.get("diff_count", 0),
+                "重算时间": attempt.get("尝试时间"),
+            })
+        # 兼容旧的直接记录
+        history.extend(self._recalc_history)
+        return history
 
     # ── Data artifacts for cross-module consumption ──
 

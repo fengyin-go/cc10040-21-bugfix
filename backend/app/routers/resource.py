@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
+from app.services.recalc_engine import BusinessRejection
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -85,7 +86,10 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
-    entry, missing = service.create_entry(payload.values)
+    try:
+        entry, missing = service.create_entry(payload.values)
+    except BusinessRejection as exc:
+        return ActionResult(ok=False, message=exc.message)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
@@ -94,5 +98,8 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    try:
+        entry, message = service.run_action(entry_id, payload.action.strip())
+    except BusinessRejection as exc:
+        return ActionResult(ok=False, message=exc.message)
     return ActionResult(ok=entry is not None, message=message, entry=entry)

@@ -243,14 +243,28 @@ def detection_coverage():
 
 @router.post("/recalc/{task_id}/start")
 def start_recalc(task_id: int):
-    """启动口径重算"""
+    """启动口径重算：缺版/倒序等失败会在响应中说明原因并保留首次失败留痕"""
     svc = RecalcEngineService()
     return svc.start_recalc(task_id)
 
 
+@router.get("/recalc/{task_id}/eligibility")
+def recalc_eligibility(task_id: int):
+    """原任务入口给出的启动资格与可用差异说明"""
+    svc = RecalcEngineService()
+    return svc.check_eligibility(task_id)
+
+
+@router.get("/recalc/available-diffs")
+def recalc_available_diffs(metric_name: str | None = None, record_date: str | None = None):
+    """报告消费面：仅获准且实际完成、指标与记录日期一致的窗口差异"""
+    svc = RecalcEngineService()
+    return svc.get_available_diffs(metric_name=metric_name, record_date=record_date)
+
+
 @router.get("/recalc/history")
 def recalc_history(metric_name: str | None = None):
-    """获取重算历史"""
+    """获取重算历史（按任务与尝试回写，含首次失败记录）"""
     svc = RecalcEngineService()
     return svc.get_recalc_history(metric_name)
 
@@ -264,9 +278,23 @@ def estimate_recalc_impact(task_id: int):
 
 @router.post("/metric/{metric_id}/recalc")
 def recalc_metric(metric_id: int, new_caliber_version: str, time_range: str):
-    """触发指标历史数据重算"""
+    """登记指标历史数据重算申请（目标版次不存在/日期倒序时拒绝受理）"""
     svc = MetricDefinitionService()
     result, msg = svc.recalc_metric_history(metric_id, new_caliber_version, time_range)
+    return {"ok": result is not None, "message": msg, "entry": result}
+
+
+@router.post("/metric/{metric_id}/recalc/close-and-reregister")
+def close_and_reregister_recalc(
+    metric_id: int,
+    new_caliber_version: str,
+    time_range: str,
+    previous_application_id: int,
+):
+    """结束原申请并登记关联任务出账：原申请保留首次失败身份"""
+    svc = MetricDefinitionService()
+    result, msg = svc.close_and_reregister_recalc(
+        metric_id, new_caliber_version, time_range, previous_application_id)
     return {"ok": result is not None, "message": msg, "entry": result}
 
 
